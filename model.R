@@ -1,3 +1,4 @@
+TOLERANCE <- sqrt(.Machine$double.eps)
 
 DISTRIBUTIONS <- list(
   NORMAL = list(density = dnorm, distribution = pnorm, quantile = qnorm, support_lower = -Inf, support_upper = Inf),
@@ -6,7 +7,7 @@ DISTRIBUTIONS <- list(
 )
 
 checked_integrate <- function(f, lower, upper) {
-  integral <- stats::integrate(f, lower, upper, rel.tol = .Machine$double.eps^0.5, subdivisions = 1000L)
+  integral <- stats::integrate(f, lower, upper, rel.tol = TOLERANCE, subdivisions = 1000L)
   stopifnot(integral$message == "OK")
   integral$value
 }
@@ -32,17 +33,17 @@ new_field <- function(type_dist, noise_dist, gamma, sigma) {
 # unpacked as "f".
 unpack_field <- function(field) {
   env <- parent.frame()
-  
+
   env$f <- field$noise_dist$density
   env$F <- field$noise_dist$distribution
   env$F_inv <- field$noise_dist$quantile
   env$F_support <- list(lower = field$noise_dist$support_lower, upper = field$noise_dist$support_upper)
-  
+
   env$g <- field$type_dist$density
   env$G <- field$type_dist$distribution
   env$G_inv <- field$type_dist$quantile
   env$G_support <- list(lower = field$type_dist$support_lower, upper = field$type_dist$support_upper)
-  
+
   env$gamma <- field$gamma
   env$sigma <- field$sigma
 }
@@ -75,147 +76,95 @@ x_P <- function(a, p, field) {
   stopifnot(0 <= a && a <= 1)
   stopifnot(sigma > 0)
   stopifnot(0 < p && p < 1)
-  
+
+  if (a == 0) {
+    return(sigma * F_inv(1-p) + G_inv(1))
+  }
+
   func <- function(x) .supply_integral(x, a, field) - (p * a)
-  
+
   # TODO: Be better at finding lower and upper bounds for the root finder.
   # How about Newton-Raphson instead?
   uniroot(func, c(-1000, 1000), extendInt = "downX", check.conv = TRUE)$root
 }
 
-x_P <- Vectorize(x_P, "a")
+x_P <- Vectorize(x_P, c("a", "p"))
 
 
 # Equilibria
 
-.field_equations <- function(field, x, a) {
-  unpack_field(field)
-  
-  # Remember to handle the non-interior parts of the demand curve
-  x_0 <- x_D(0, field)
-  x_1 <- x_D(1, field)
+.system_equations_p <- function(fields, payline, as) {
+  ps <- payline(as)
 
-  if (a == 0 && x >= x_0) {
-    demand <- 0
-  } else if (a == 1 && x <= x_1) {
-    demand <- 0
-  } else {
-    demand <- 1 - F((x - G_inv(1-a)) / sigma) - gamma
-  }
+  purrr::pmap_dbl(list(fields, as, ps), function(field, a, p) {
+    unpack_field(field)
 
-  supply <- .supply_integral(x, a, field) / a
-  
-  c(demand, supply)
-}
+    x <- x_D(a, field)
 
-.system_equations <- function(fields, payline, xs, as) {
-  # Compute vector of demand and supply for each field
-  equations <- purrr::flatten_dbl(purrr::pmap(list(fields, xs, as), .field_equations))
-  
-  # Subtract p from the supply equations
-  ps <- payline$func(as)
-  for (i in 1:length(ps)) {
-    equations[i*2] <- equations[i*2] - ps[i]
-  }
-  
-  equations
-}
-
-# Compute the Jacobian for each field
-.field_jacobian <- function(field, x, a) {
-  unpack_field(field)
-  
-  D_x <- -(1 / sigma) * f((x - G_inv(1-a)) / sigma)
-  D_a <- -(1 / sigma) * f((x - G_inv(1-a)) / sigma) / g(G_inv(1-a))
-  
-  # TODO: Integration by substitution here?
-  P_x <- -(1 / (a * sigma)) * checked_integrate(
-    function(theta) f((x-theta) / sigma) * g(theta),
-    G_inv(1-a),
-    G_support$upper
-  )
-  
-  P_a <- -(1/a^2 * sigma) * checked_integrate(
-    function(theta) (1 - G(theta)) * f((x-theta) / sigma),
-    G_inv(1-a),
-    G_support$upper
-  )
-  
-  matrix(c(D_x, D_a, P_x, P_a), nrow = 2, ncol = 2, byrow = TRUE)
-}
-
-
-.system_jacobian <- function(fields, payline, xs, as) {
-  # First build a block diagonal matrix of each field's demand/supply system
-  jacobian <- as.matrix(Matrix::bdiag(purrr::pmap(list(fields, xs, as), .field_jacobian)))
-  
-  # Now subtract the payline Jacobian
-  payline_jacobian <- payline$jacobian(as)
-  for (i in 1:nrow(payline_jacobian)) {
-    for (j in 1:ncol(payline_jacobian)) {
-      jacobian[i*2, j*2] <- jacobian[i*2, j*2] - payline_jacobian[i, j]
+    # Handle non-interior equilibria where supply intersects with the vertical
+    # part of demand
+    if (abs(a - 0) <= TOLERANCE && x < x_P(0, p, field)) {
+      return(0)
+    } else if (abs(a - 1) <= TOLERANCE && x > x_P(1, p, field)) {
+      return(0)
     }
-  }
 
-  jacobian
+    val <- 1 - F((x - G_inv(1 - a)) / sigma)
+
+    if (a > 0) {
+      integrand <- function(theta) (1 - G(theta)) * f((x - theta) / sigma)
+      val <- val + (checked_integrate(integrand, G_inv(1 - a), G_support$upper) / (a * sigma))
+    }
+
+    val - p
+  })
 }
+
 
 compute_equilibrium <- function(fields, payline) {
-  get_xs <- function(vars) vars[1:(length(vars)/2)]
-  get_as <- function(vars) vars[(length(vars)/2+1):length(vars)]
-  
-  func <- function(vars) {
-    .system_equations(fields, payline, get_xs(vars), get_as(vars))
+  objective <- function(as) {
+    sum(.system_equations_p(fields, payline, as) ^ 2)
   }
-  
-  jacobian <- function(vars) {
-    .system_jacobian(fields, payline, get_xs(vars), get_as(vars))
-  }
-  
-  # Start on the demand curve at a=1/2
-  start_as <- rep(0.5, length(fields))
-  start_xs <- purrr::map2_dbl(start_as, fields, x_D)
-  
-  solution <- rootSolve::multiroot(
-    f = func,
-    start = c(start_xs, start_as),
-    jactype = "fullusr",
-    jacfunc = jacobian
+
+  # Constrained optimisation: 0 <= a <= 1
+  ui <- as.matrix(Matrix::bdiag(rep(list(c(1, -1)), length(fields))))
+  ci <- rep(c(0, -1), length(fields))
+
+  result <- constrOptim(
+    theta = rep(0.5, length(fields)),
+    f = objective,
+    ui = ui,
+    ci = ci,
+    method = "Nelder-Mead",
+    control = list(warn.1d.NelderMead = FALSE)
   )
-  
-  # TODO: Check that we actually found an equilibrium
-  
+
+  stopifnot(result$convergence == 0)
+
+  as <- result$par
+  as[abs(as - 0) <= TOLERANCE] <- 0
+  as[abs(as - 1) <= TOLERANCE] <- 1
+
+  ps <- payline(as)
+
   list(
-    xs = get_xs(solution$root),
-    as = get_as(solution$root)
+    as = as,
+    xs = purrr::pmap_dbl(list(as, ps, fields), x_P)
   )
 }
 
 constant_payline <- function(ps) {
-  list(
-    func = function(as) {
-      stopifnot(length(as) == length(ps))
-      ps
-    },
-    
-    jacobian = function(as) {
-      stopifnot(length(as) == length(ps))
-      matrix(0, nrow = length(ps), ncol = length(ps))
-    }
-  )
+  function(as) {
+    stopifnot(length(as) == length(ps))
+    ps
+  }
 }
 
 qpa <- function(rhos, total_budget) {
-  list(
-    func = function(as) {
-      stopifnot(length(as) == length(rhos))
-      total_budget * as ^ (rhos - 1) / sum(as ^ rhos)
-    },
-    
-    jacobian = function(as) {
-      stopifnot(length(as) == length(rhos))
-      (diag((rhos-1) * as^(rhos-2) * sum(as^rhos)) - (outer(as^(rhos-1), as^(rhos-1)) %*% diag(rhos))) / sum(as^rhos)^2
-    }
-  )
+  function(as) {
+    stopifnot(length(as) == length(rhos))
+    as[abs(as - 0) <= TOLERANCE] <- 0
+    as[abs(as - 1) <= TOLERANCE] <- 1
+    total_budget * as ^ (rhos - 1) / sum(as ^ rhos)
+  }
 }
-
