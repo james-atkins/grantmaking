@@ -1,7 +1,11 @@
 library(shiny)
 library(ggplot2)
+library(glue)
+library(purrr)
+library(assertthat)
 
 source("model.R")
+source("ge.R")
 
 
 # Define UI for application that draws a histogram
@@ -11,7 +15,6 @@ ui <- fluidPage(
     titlePanel("Grantmaking"),
 
     tabsetPanel(
-
         tabPanel(
             "Constant Payline",
 
@@ -63,12 +66,16 @@ ui <- fluidPage(
                     plotOutput("demandSupplyPlot")
                 )
             )
-        )
+        ),
+
+        tabPanel("General Equilibrium", ge_ui())
 
     )
 )
 
 server <- function(input, output) {
+
+    ge_server(input, output)
 
     output$demandSupplyPlot <- renderPlot({
         field <- new_field(
@@ -85,6 +92,7 @@ server <- function(input, output) {
         ggplot() +
             xlim(0, 1) +
             geom_function(fun = x_D, args = list(field = field), colour = "blue") +
+            geom_segment(aes(x = 0, xend = 0, y = x_D(0, field), yend = x_D(0, field) + 0.2), colour = "blue") +
             geom_function(fun = x_P, args = list(p = input$p, field = field), colour = "red") +
             geom_point(data = as.data.frame(eq), aes(x = as, y = xs), size = 2) +
             labs(x = "Applications", y = "Standard") +

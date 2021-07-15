@@ -8,7 +8,7 @@ DISTRIBUTIONS <- list(
 
 checked_integrate <- function(f, lower, upper) {
   integral <- stats::integrate(f, lower, upper, rel.tol = TOLERANCE, subdivisions = 1000L)
-  stopifnot(integral$message == "OK")
+  assert_that(integral$message == "OK")
   integral$value
 }
 
@@ -18,6 +18,9 @@ checked_integrate <- function(f, lower, upper) {
 # - gamma (cost-benefit ratio)
 # - sigma
 new_field <- function(type_dist, noise_dist, gamma, sigma) {
+  assert_that(is_scalar_double(gamma) || is_scalar_integer(gamma))
+  assert_that(is_scalar_double(sigma) || is_scalar_integer(sigma))
+
   list(
     type_dist = type_dist,
     noise_dist = noise_dist,
@@ -52,14 +55,14 @@ unpack_field <- function(field) {
 # Application demand
 a_D <- function(x, field) {
   unpack_field(field)
-  stopifnot(sigma > 0)
+  assert_that(sigma > 0)
   1 - G(x - sigma * F_inv(1 - gamma))
 }
 
 # Inverse demand
 x_D <- function(a, field) {
   unpack_field(field)
-  stopifnot(sigma > 0)
+  assert_that(sigma > 0)
   G_inv(1-a) + sigma * F_inv(1 - gamma)
 }
 
@@ -73,13 +76,15 @@ x_D <- function(a, field) {
 
 x_P <- function(a, p, field) {
   unpack_field(field)
-  stopifnot(0 <= a && a <= 1)
-  stopifnot(sigma > 0)
-  stopifnot(0 < p && p < 1)
+  assert_that(0 <= a && a <= 1)
+  assert_that(sigma > 0)
+  assert_that(0 < p && p < 1)
 
   if (a == 0) {
     return(sigma * F_inv(1-p) + G_inv(1))
   }
+
+  # TODO: Handle unbounded type distribution
 
   func <- function(x) .supply_integral(x, a, field) - (p * a)
 
@@ -96,7 +101,9 @@ x_P <- Vectorize(x_P, c("a", "p"))
 .system_equations_p <- function(fields, payline, as) {
   ps <- payline(as)
 
-  purrr::pmap_dbl(list(fields, as, ps), function(field, a, p) {
+  pmap_dbl(list(fields, as, ps), function(field, a, p) {
+    assert_that(length(a) == 1)
+    assert_that(length(p) == 1)
     unpack_field(field)
 
     x <- x_D(a, field)
@@ -139,7 +146,7 @@ compute_equilibrium <- function(fields, payline) {
     control = list(warn.1d.NelderMead = FALSE)
   )
 
-  stopifnot(result$convergence == 0)
+  assert_that(result$convergence == 0)
 
   as <- result$par
   as[abs(as - 0) <= TOLERANCE] <- 0
@@ -149,20 +156,21 @@ compute_equilibrium <- function(fields, payline) {
 
   list(
     as = as,
-    xs = purrr::pmap_dbl(list(as, ps, fields), x_P)
+    xs = pmap_dbl(list(as, ps, fields), x_P),
+    ps = ps
   )
 }
 
 constant_payline <- function(ps) {
   function(as) {
-    stopifnot(length(as) == length(ps))
+    assert_that(length(as) == length(ps))
     ps
   }
 }
 
 qpa <- function(rhos, total_budget) {
   function(as) {
-    stopifnot(length(as) == length(rhos))
+    assert_that(length(as) == length(rhos))
     as[abs(as - 0) <= TOLERANCE] <- 0
     as[abs(as - 1) <= TOLERANCE] <- 1
     total_budget * as ^ (rhos - 1) / sum(as ^ rhos)
